@@ -190,6 +190,13 @@ def merge_and_dedupe(rows: Iterable[NormalizedRow]) -> pd.DataFrame:
 
     df = pd.DataFrame([asdict(r) for r in deduped], columns=CANONICAL_COLUMNS)
     if not df.empty:
+        # asdict() produces a column of plain Python datetime objects (or
+        # None), which pandas leaves as dtype 'object' rather than a proper
+        # datetime64 dtype -- that silently breaks the .dt accessor used
+        # later (filter_by_date_range, export.py's .strftime() calls still
+        # work either way, but .dt.date does not on an object column).
+        # Normalize explicitly here, once, right after construction.
+        df["sent_on"] = pd.to_datetime(df["sent_on"], utc=True, errors="coerce")
         df = df.sort_values("sent_on", ascending=False, na_position="last").reset_index(drop=True)
     return df
 
