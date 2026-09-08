@@ -103,7 +103,7 @@ def main():
 
         with st.spinner("Checking search scope..."):
             try:
-                count, has_more = preflight_match_count(token_manager, value, exact)
+                count, has_more, skipped = preflight_match_count(token_manager, value, exact)
             except ZohoAPIError as exc:
                 st.error(f"Zoho API error while checking search scope: {exc}")
                 st.stop()
@@ -111,12 +111,24 @@ def main():
         st.session_state["preflight_done"] = True
         st.session_state["preflight_count"] = count
         st.session_state["preflight_broad"] = has_more or count > 50
+        st.session_state["preflight_skipped"] = skipped
 
     # --- Pre-flight safeguard for broad searches ---
     if st.session_state.get("preflight_done") and "result" not in st.session_state:
         params = st.session_state["search_params"]
         count = st.session_state["preflight_count"]
         broad = st.session_state["preflight_broad"]
+        preflight_skipped = st.session_state.get("preflight_skipped") or []
+
+        if preflight_skipped:
+            skipped_names = ", ".join(s["module"] for s in preflight_skipped)
+            st.warning(
+                f"Could not search {skipped_names} — that module doesn't have a searchable "
+                f"'Email' column in this Zoho org (or another query error occurred). "
+                f"Results below only cover the remaining module(s). See details below."
+            )
+            with st.expander("Skipped module details"):
+                st.dataframe(preflight_skipped, use_container_width=True)
 
         if broad:
             st.warning(
@@ -183,6 +195,15 @@ def main():
 
 def _render_results(result: SearchResult, params: dict):
     st.divider()
+
+    if result.skipped_modules:
+        skipped_names = ", ".join(s["module"] for s in result.skipped_modules)
+        st.warning(
+            f"Could not search {skipped_names} — see details below. "
+            f"Results only cover the remaining module(s)."
+        )
+        with st.expander("Skipped module details"):
+            st.dataframe(result.skipped_modules, use_container_width=True)
 
     if not result.matches:
         st.info(
