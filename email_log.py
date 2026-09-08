@@ -204,14 +204,26 @@ def merge_and_dedupe(rows: Iterable[NormalizedRow]) -> pd.DataFrame:
 def filter_by_date_range(df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
     """Post-filter the merged DataFrame to a date range (inclusive). Applied
     after merge/dedupe since Get-Emails-of-Record has no server-side date
-    filter — see plan §3/§4."""
+    filter — see plan §3/§4.
+
+    Compares full UTC Timestamps rather than using the .dt.date accessor:
+    .dt.date on a tz-aware column returned a datetime-like array (not a
+    plain object array of date()s) in the pandas/numpy build Streamlit
+    Cloud runs, which made the >=/<= comparison against a plain
+    datetime.date raise "Invalid comparison between dtype=... and
+    datetime.date" — a version-specific accessor quirk this sidesteps by
+    only ever comparing like-typed Timestamps."""
 
     if df.empty:
         return df
 
     mask = df["sent_on"].notna()
     if start_date is not None:
-        mask &= df["sent_on"].dt.date >= start_date
+        start_ts = pd.Timestamp(start_date, tz="UTC")
+        mask &= df["sent_on"] >= start_ts
     if end_date is not None:
-        mask &= df["sent_on"].dt.date <= end_date
+        # Exclusive upper bound at the start of the *next* day, so the
+        # chosen end_date is fully included regardless of time-of-day.
+        end_ts = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)
+        mask &= df["sent_on"] < end_ts
     return df[mask].reset_index(drop=True)
