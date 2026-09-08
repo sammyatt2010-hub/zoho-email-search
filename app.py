@@ -17,7 +17,7 @@ from email_log import CANONICAL_COLUMNS
 from export import build_pdf_report, build_summary_df, build_xlsx_report
 from search import SearchResult, preflight_match_count, run_search
 from zoho_auth import ZohoAuthError, get_token_manager
-from zoho_client import ZohoAPIError
+from zoho_client import ZohoAPIError, get_record_emails
 
 st.set_page_config(page_title="Zoho CRM Email Log Search", page_icon="✉️", layout="wide")
 
@@ -190,10 +190,10 @@ def main():
     if "result" in st.session_state:
         result: SearchResult = st.session_state["result"]
         params = st.session_state["search_params"]
-        _render_results(result, params)
+        _render_results(result, params, token_manager)
 
 
-def _render_results(result: SearchResult, params: dict):
+def _render_results(result: SearchResult, params: dict, token_manager=None):
     st.divider()
 
     if result.skipped_modules:
@@ -230,6 +230,7 @@ def _render_results(result: SearchResult, params: dict):
             f"Matched {len(result.matches)} record(s), but no logged emails were found "
             f"in the selected date range / email types."
         )
+        _render_debug_raw_fetch(result, token_manager)
         return
 
     bounced_n = int(detail_df["bounced"].sum())
@@ -284,6 +285,42 @@ def _render_results(result: SearchResult, params: dict):
             mime="application/pdf",
             use_container_width=True,
         )
+
+
+def _render_debug_raw_fetch(result: SearchResult, token_manager):
+    """Temporary diagnostic: matched records but zero normalized rows is
+    suspicious given known email history exists in this org. Fetch the raw
+    (pre-normalization) response for the first matched record across every
+    email type, so we can see exactly what Zoho is sending back rather than
+    guess at why normalize_email_record() produced nothing."""
+
+    if token_manager is None or not result.matches:
+        return
+
+    with st.expander("🔧 Debug: raw API response for the first matched record"):
+        match = result.matches[0]
+        st.write(f"Fetching raw emails for: **{match.module} / {match.name}** (id `{match.record_id}`)")
+        try:
+            events = list(
+                get_record_emails(
+                    token_manager,
+                    match.module,
+                    match.record_id,
+                    match.name,
+                    email_types=ALL_EMAIL_TYPES,
+                )
+            )
+        except ZohoAPIError as exc:
+            st.error(f"Raw fetch failed: {exc}")
+            return
+
+        st.write(f"Raw event count across all types: **{len(events)}**")
+        if events:
+            st.json(events[0].raw)
+            if len(events) > 1:
+                st.caption(f"(+{len(events) - 1} more not shown)")
+        else:
+            st.write("Zoho returned zero email events for this record across all four types.")
 
 
 if __name__ == "__main__":
