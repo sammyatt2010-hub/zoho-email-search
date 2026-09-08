@@ -43,6 +43,7 @@ class SearchResult:
     summary_counts: dict  # {address: count}
     failed_records: list[dict] = field(default_factory=list)
     capped: bool = False  # True if MAX_MATCHED_RECORDS was hit
+    skipped_modules: list[dict] = field(default_factory=list)  # modules that errored at Stage 1
 
 
 def _build_where_clause(email_field: str, search_value: str, exact: bool) -> str:
@@ -56,30 +57,39 @@ def _build_where_clause(email_field: str, search_value: str, exact: bool) -> str
 
 def preflight_match_count(
     token_manager: ZohoTokenManager, search_value: str, exact: bool
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[dict]]:
     """Run just the first (cheapest) page per module to give the user a
     rough sense of scale before committing to the full pull. Returns
-    (count_found_in_first_pages, any_module_has_more) — the second value
-    signals "this is a broad search, there may be many more than shown"."""
+    (count_found_in_first_pages, any_module_has_more, skipped_modules) —
+    has_more signals "this is a broad search, there may be many more than
+    shown"; skipped_modules lists any module that errored out (e.g. a
+    module whose COQL-selected field doesn't exist in this org, such as
+    Accounts not having a plain Email field by default) so the caller can
+    surface that rather than have the whole search abort."""
 
     total = 0
     has_more = False
+    skipped: list[dict] = []
     for module, cfg in MODULES.items():
         where = _build_where_clause(cfg["email_field"], search_value, exact)
         count = 0
-        gen = run_coql(
-            token_manager,
-            module,
-            cfg["select_fields"],
-            where,
-            limit=COQL_PREFLIGHT_LIMIT,
-        )
-        for _ in gen:
-            count += 1
+        try:
+            gen = run_coql(
+                token_manager,
+                module,
+                cfg["select_fields"],
+                where,
+                limit=COQL_PREFLIGHT_LIMIT,
+            )
+            for _ in gen:
+                count += 1
+        except ZohoAPIError as exc:
+            skipped.append({"module": module, "error": str(exc)})
+            continue
         total += count
         if count >= COQL_PREFLIGHT_LIMIT:
             has_more = True
-    return total, has_more
+    return total, has_more, skipped
 
 
 def match_records(
@@ -88,35 +98,45 @@ def match_records(
     exact: bool,
     *,
     on_progress: Callable[[str, int], None] | None = None,
-) -> tuple[list[CoqlMatch], bool]:
+) -> tuple[list[CoqlMatch], bool, list[dict]]:
     """Stage 1: find every matching Contact/Lead/Account. Returns
-    (matches, capped) where capped is True if MAX_MATCHED_RECORDS was hit
-    and the search was stopped early."""
+    (matches, capped, skipped_modules) where capped is True if
+    MAX_MATCHED_RECORDS was hit and the search was stopped early, and
+    skipped_modules lists any module whose COQL query errored (e.g. an
+    invalid/missing column for that module in this org) — that module is
+    skipped rather than aborting the whole search."""
 
     matches: list[CoqlMatch] = []
     capped = False
+    skipped: list[dict] = []
 
     for module, cfg in MODULES.items():
         if capped:
             break
         where = _build_where_clause(cfg["email_field"], search_value, exact)
         module_count = 0
-        for record in run_coql(
-            token_manager, module, cfg["select_fields"], where, limit=COQL_FULL_LIMIT
-        ):
-            email = record.get(cfg["email_field"]) or ""
-            name = record.get(cfg["name_field"]) or record.get("id", "")
-            matches.append(
-                CoqlMatch(module=module, record_id=str(record["id"]), email=email, name=str(name))
-            )
-            module_count += 1
-            if on_progress:
-                on_progress(module, len(matches))
-            if len(matches) >= MAX_MATCHED_RECORDS:
-                capped = True
-                break
+        try:
+            for record in run_coql(
+                token_manager, module, cfg["select_fields"], where, limit=COQL_FULL_LIMIT
+            ):
+                email = record.get(cfg["email_field"]) or ""
+                name = record.get(cfg["name_field"]) or record.get("id", "")
+                matches.append(
+                    CoqlMatch(
+                        module=module, record_id=str(record["id"]), email=email, name=str(name)
+                    )
+                )
+                module_count += 1
+                if on_progress:
+                    on_progress(module, len(matches))
+                if len(matches) >= MAX_MATCHED_RECORDS:
+                    capped = True
+                    break
+        except ZohoAPIError as exc:
+            skipped.append({"module": module, "error": str(exc)})
+            continue
 
-    return matches, capped
+    return matches, capped, skipped
 
 
 def pull_email_logs(
@@ -190,7 +210,7 @@ def run_search(
     continue/narrow prompt — that's a UI decision made in app.py using
     preflight_match_count() before calling this."""
 
-    matches, capped = match_records(
+    matches, capped, skipped_modules = match_records(
         token_manager, search_value, exact, on_progress=on_stage1_progress
     )
 
@@ -210,4 +230,5 @@ def run_search(
         summary_counts=summary_counts,
         failed_records=failed,
         capped=capped,
+        skipped_modules=skipped_modules,
     )
