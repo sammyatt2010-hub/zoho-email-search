@@ -13,8 +13,9 @@ import streamlit as st
 
 from auth_gate import check_password
 from constants import ALL_EMAIL_TYPES, DEFAULT_EMAIL_TYPES, MAX_MATCHED_RECORDS, MAX_DISPLAY_ROWS
-from email_log import CANONICAL_COLUMNS
+from email_log import CANONICAL_COLUMNS, filter_by_date_range
 from export import build_pdf_report, build_summary_df, build_xlsx_report
+from report_import import filter_by_address, parse_report_files
 from search import SearchResult, preflight_match_count, run_search
 from zoho_auth import ZohoAuthError, get_token_manager
 from zoho_client import ZohoAPIError, get_record_emails
@@ -38,7 +39,14 @@ def _normalize_search_value(raw: str, exact: bool) -> str:
 
 
 def _reset_search_state():
-    for key in ("preflight_done", "preflight_count", "preflight_broad", "result"):
+    for key in (
+        "preflight_done",
+        "preflight_count",
+        "preflight_broad",
+        "preflight_skipped",
+        "result",
+        "report_result",
+    ):
         st.session_state.pop(key, None)
 
 
@@ -46,17 +54,39 @@ def main():
     if not check_password():
         st.stop()
 
-    try:
-        token_manager = get_token_manager()
-    except ZohoAuthError as exc:
-        st.error(f"Zoho credentials are not configured correctly: {exc}")
-        st.stop()
-
     st.title("Zoho CRM Email Log Search")
     st.caption(
         "Search every email Zoho CRM has logged against a Contact, Lead, or Account, "
         "by exact address or by domain, and export a combined report."
     )
+
+    data_source = st.radio(
+        "Data source",
+        ["Live Zoho API search", "Uploaded report file(s)"],
+        horizontal=True,
+        help=(
+            "Live search queries Zoho directly, but this org's mailbox-synced email "
+            "history (the 'User emails' type) currently fails on Zoho's side with a "
+            "CANNOT_PROCESS error — a Zoho mailbox/IMAP-sync configuration issue, not "
+            "something this app controls. As a workaround, export the 'Sent Email "
+            "Status' report from Zoho CRM's Reports section and upload it here instead "
+            "— everything (search, date filter, export) then runs against that file "
+            "locally."
+        ),
+    )
+
+    if data_source == "Uploaded report file(s)":
+        _run_report_mode()
+    else:
+        _run_live_mode()
+
+
+def _run_live_mode():
+    try:
+        token_manager = get_token_manager()
+    except ZohoAuthError as exc:
+        st.error(f"Zoho credentials are not configured correctly: {exc}")
+        st.stop()
 
     with st.form("search_form"):
         col1, col2 = st.columns([1, 2])
@@ -191,6 +221,169 @@ def main():
         result: SearchResult = st.session_state["result"]
         params = st.session_state["search_params"]
         _render_results(result, params, token_manager)
+
+
+def _run_report_mode():
+    st.info(
+        "In Zoho CRM, go to **Reports → All Reports → Sent Email Status**, run it, "
+        "and export the result (XLSX or CSV) — Zoho paginates large reports into "
+        "several files (e.g. rows 0–1000, 1000–2000, ...); upload as many as you "
+        "have and they'll be merged and deduplicated automatically. Everything below "
+        "then runs against that uploaded data — no further Zoho API calls involved."
+    )
+
+    with st.form("report_search_form"):
+        uploaded_files = st.file_uploader(
+            "Sent Email Status export(s)",
+            type=["xlsx", "csv"],
+            accept_multiple_files=True,
+        )
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            mode = st.radio("Search mode", ["Exact email", "Domain"], horizontal=False, key="report_mode")
+        with col2:
+            placeholder = "name@example.com" if mode == "Exact email" else "example.com or @example.com"
+            search_input = st.text_input("Search value", placeholder=placeholder, key="report_search_value")
+
+        col3, col4 = st.columns(2)
+        with col3:
+            start_date = st.date_input(
+                "From", value=date.today() - timedelta(days=90), key="report_start_date"
+            )
+        with col4:
+            end_date = st.date_input("To", value=date.today(), key="report_end_date")
+
+        submitted = st.form_submit_button("Search uploaded report(s)")
+
+    if submitted:
+        _reset_search_state()
+
+        if not uploaded_files:
+            st.warning("Upload at least one Sent Email Status report file (.xlsx or .csv).")
+            st.stop()
+        if not search_input.strip():
+            st.warning("Enter an email address or domain to search for.")
+            st.stop()
+
+        exact = mode == "Exact email"
+        value = _normalize_search_value(search_input, exact)
+
+        files = [(f.name, f.getvalue()) for f in uploaded_files]
+        with st.spinner("Parsing uploaded report file(s)..."):
+            try:
+                merged_df, infos = parse_report_files(files)
+            except Exception as exc:  # noqa: BLE001 - surface any parse failure, don't crash the app
+                st.error(f"Could not parse the uploaded file(s): {exc}")
+                st.stop()
+
+        filtered_df = filter_by_address(merged_df, value, exact)
+        filtered_df = filter_by_date_range(filtered_df, start_date, end_date)
+
+        st.session_state["report_result"] = {
+            "df": filtered_df,
+            "total_parsed": len(merged_df),
+            "infos": infos,
+            "params": {
+                "value": value,
+                "exact": exact,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        }
+
+    if "report_result" in st.session_state:
+        _render_report_results(st.session_state["report_result"])
+
+
+def _render_report_results(report_result: dict):
+    st.divider()
+
+    infos = report_result["infos"]
+    errors = [i for i in infos if "error" in i]
+    parsed = [i for i in infos if "error" not in i]
+
+    if errors:
+        with st.expander(f"⚠️ {len(errors)} file(s) could not be parsed — click to view", expanded=True):
+            st.dataframe(errors, use_container_width=True)
+
+    if parsed:
+        total_data_rows = sum(i["data_rows"] for i in parsed)
+        st.caption(
+            f"Parsed {len(parsed)} file(s), {total_data_rows} report row(s) in total, "
+            f"{report_result['total_parsed']} deduplicated email event(s) across all "
+            f"uploaded files (before the search/date filter below)."
+        )
+
+    params = report_result["params"]
+    detail_df = report_result["df"]
+
+    if detail_df.empty:
+        st.info(
+            f"No emails found for **{params['value']}** "
+            f"({'exact' if params['exact'] else 'domain'}) in the uploaded report(s) "
+            f"within the selected date range."
+        )
+        return
+
+    bounced_n = int(detail_df["bounced"].sum())
+    opened_n = int(detail_df["opened"].sum())
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Email rows (deduped)", len(detail_df))
+    m2.metric("Bounced", bounced_n)
+    m3.metric("Opened", opened_n)
+
+    st.subheader("Breakdown by recipient address")
+    summary_df = build_summary_df(detail_df)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.subheader(f"Email log detail (showing up to {MAX_DISPLAY_ROWS} of {len(detail_df)} rows)")
+    display_df = detail_df.head(MAX_DISPLAY_ROWS)[
+        ["sent_on", "subject", "sent_to", "direction", "source_module", "opened", "bounced"]
+    ]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Export")
+    meta = {
+        "search_value": params["value"],
+        "search_mode": "Exact" if params["exact"] else "Domain",
+        "date_from": params["start_date"].isoformat(),
+        "date_to": params["end_date"].isoformat(),
+        "matched_record_count": len(detail_df),
+        "record_count_label": "Matching email row(s) found in uploaded report(s):",
+        "exported_on": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "failed_record_count": 0,
+        "source_label": (
+            "Source: Zoho CRM 'Sent Email Status' report export(s), via the "
+            "zoho-email-search tool (uploaded report mode)."
+        ),
+    }
+
+    safe_value = params["value"].lstrip("@").replace("/", "-")
+    filename_stem = f"zoho-email-log_{safe_value}_{params['start_date']}_to_{params['end_date']}"
+
+    col1, col2 = st.columns(2)
+    with col1:
+        xlsx_buf = build_xlsx_report(detail_df, summary_df, meta)
+        st.download_button(
+            "Download XLSX report",
+            data=xlsx_buf,
+            file_name=f"{filename_stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="report_xlsx_dl",
+        )
+    with col2:
+        pdf_buf = build_pdf_report(detail_df, summary_df, meta)
+        st.download_button(
+            "Download PDF report",
+            data=pdf_buf,
+            file_name=f"{filename_stem}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="report_pdf_dl",
+        )
 
 
 def _render_results(result: SearchResult, params: dict, token_manager=None):
