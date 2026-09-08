@@ -94,11 +94,12 @@ def build_xlsx_report(detail_df: pd.DataFrame, summary_df: pd.DataFrame, meta: d
     ws["A2"].font = subtitle_font
     ws.row_dimensions[2].height = 18
 
+    record_count_label = meta.get("record_count_label", "Matching Contacts/Leads/Accounts found:")
     meta_rows = [
         ("Search mode:", meta.get("search_mode", "")),
         ("Search value:", meta.get("search_value", "")),
         ("Date range:", f"{meta.get('date_from', '')} to {meta.get('date_to', '')}"),
-        ("Matching Contacts/Leads/Accounts found:", str(meta.get("matched_record_count", ""))),
+        (record_count_label, str(meta.get("matched_record_count", ""))),
         ("Unique email rows after de-duplication:", str(len(detail_df))),
         ("Of which bounced:", str(int(detail_df["bounced"].sum()) if not detail_df.empty else 0)),
         ("Of which opened:", str(int(detail_df["opened"].sum()) if not detail_df.empty else 0)),
@@ -292,11 +293,12 @@ def build_pdf_report(detail_df: pd.DataFrame, summary_df: pd.DataFrame, meta: di
     bounced_n = int(detail_df["bounced"].sum()) if not detail_df.empty else 0
     opened_n = int(detail_df["opened"].sum()) if not detail_df.empty else 0
 
+    record_count_label = meta.get("record_count_label", "Matching Contacts/Leads/Accounts found:")
     meta_rows = [
         ["Search mode:", meta.get("search_mode", "")],
         ["Search value:", meta.get("search_value", "")],
         ["Date range:", f"{meta.get('date_from', '')} to {meta.get('date_to', '')}"],
-        ["Matching Contacts/Leads/Accounts found:", str(meta.get("matched_record_count", ""))],
+        [record_count_label, str(meta.get("matched_record_count", ""))],
         ["Unique email rows after de-duplication:", str(len(detail_df))],
         ["Of which bounced:", str(bounced_n)],
         ["Of which opened:", str(opened_n)],
@@ -403,7 +405,9 @@ def build_pdf_report(detail_df: pd.DataFrame, summary_df: pd.DataFrame, meta: di
     story.append(tbl)
 
     story.append(Spacer(1, 10))
-    footer = "Source: Zoho CRM, via the zoho-email-search tool (live API search)."
+    footer = meta.get(
+        "source_label", "Source: Zoho CRM, via the zoho-email-search tool (live API search)."
+    )
     story.append(
         Paragraph(
             footer,
